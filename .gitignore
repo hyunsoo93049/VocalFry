@@ -178,3 +178,4 @@ env/
 env/
 env/
 >>>>>>> fb333da (Clean initial commit without env)
+.DS_Store
