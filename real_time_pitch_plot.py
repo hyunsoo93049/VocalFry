@@ -1,105 +1,117 @@
 import sys
 import numpy as np
+import sounddevice as sd
+import crepe
 import pyqtgraph as pg
-from PyQt5.QtWidgets import QApplication, QMainWindow
+import parselmouth
+from parselmouth.praat import call
+from PyQt5.QtWidgets import QMainWindow, QApplication, QLabel, QVBoxLayout, QWidget
 from PyQt5.QtCore import QTimer
+import librosa
 
-try:
-    import sounddevice as sd
-except OSError as e:
-    print("[오류] sounddevice 모듈에서 PortAudio 라이브러리를 찾을 수 없습니다.")
-    print("macOS에서는 'brew install portaudio' 후 'pip install sounddevice'를 실행하세요.")
-    sys.exit(1)
+SAMPLE_RATE = 16000
+BUFFER_DURATION = 1.5
+BUFFER_SIZE = int(SAMPLE_RATE * BUFFER_DURATION)
+VISUAL_WINDOW = 100
 
+PITCH_MIN = librosa.note_to_hz('C3')  # 130.81 Hz
+PITCH_MAX = librosa.note_to_hz('F5')  # 698.46 Hz
 
-# 🎯 C4 ~ E6 (자연음만) + 등간격 인덱스 기반
-def get_equal_indexed_notes():
-    NOTE_NAMES_FULL = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-    WHOLE_NOTES = ['C', 'D', 'E', 'F', 'G', 'A', 'B']
-    indexed_notes = []
-    index = 0
-    for n in range(60, 89):  # MIDI 60 = C4, 88 = E6
-        name = NOTE_NAMES_FULL[n % 12]
-        if name in WHOLE_NOTES:
-            full_name = name + str(n // 12 - 1)
-            freq = 440.0 * (2 ** ((n - 69) / 12))
-            indexed_notes.append((full_name, freq, index))
-            index += 1
-    return indexed_notes
+def cents_error(f0, f_ref):
+    if f0 <= 0 or f_ref <= 0 or np.isnan(f0) or np.isnan(f_ref):
+        return np.nan
+    return 1200 * np.log2(f0 / f_ref)
 
+def hz_to_note_name(hz):
+    if hz <= 0 or np.isnan(hz):
+        return "-"
+    return librosa.hz_to_note(hz, octave=True)
 
+def analyze_voice(buffer, sr):
+    snd = parselmouth.Sound(buffer, sampling_frequency=sr)
+    point_process = call(snd, "To PointProcess (periodic, cc)", 75, 500)
+    jitter = call(point_process, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3)
+    shimmer = call([snd, point_process], "Get shimmer (local)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
+    return jitter * 100, shimmer * 100
 
-def snap_to_note_index(freq, indexed_notes):
-    return min(indexed_notes, key=lambda x: abs(freq - x[1]))  # returns (name, freq, index)
-
-
-def detect_pitch(audio_data, sample_rate):
-    windowed = audio_data * np.hanning(len(audio_data))
-    fft = np.fft.rfft(windowed)
-    freqs = np.fft.rfftfreq(len(windowed), d=1 / sample_rate)
-    magnitude = np.abs(fft)
-    peak_idx = np.argmax(magnitude)
-    return freqs[peak_idx]
-
-
-class RealTimePitchPlot(QMainWindow):
+class CREPEAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("🎤 실시간 보컬 음정 그래프 (등간격)")
-        self.setGeometry(100, 100, 800, 400)
+        self.setWindowTitle("🎤 CREPE + 발성 분석기 (C3 ~ F5)")
+        self.setGeometry(100, 100, 800, 600)
 
-        # 🎼 등간격 음계 생성
-        self.indexed_notes = get_equal_indexed_notes()
+        self.plot_widget = pg.PlotWidget(title="Pitch (Hz)")
+        self.plot_widget.setYRange(PITCH_MIN, PITCH_MAX)
+        self.curve = self.plot_widget.plot(np.zeros(VISUAL_WINDOW), pen='y')
 
-        # 🎯 y축 라벨: index -> note_name
-        ticks = [(note[2], note[0]) for note in self.indexed_notes]
-        self.y_axis = pg.AxisItem(orientation='left')
-        self.y_axis.setTicks([ticks])
-        self.plot_widget = pg.PlotWidget(axisItems={'left': self.y_axis})
-        self.setCentralWidget(self.plot_widget)
+        note_labels = [f'{n}{o}' for o in range(3, 6) for n in ['C', 'D', 'E', 'F', 'G', 'A', 'B']]
+        note_labels = [n for n in note_labels if PITCH_MIN <= librosa.note_to_hz(n) <= PITCH_MAX]
+        note_ticks = [librosa.note_to_hz(n) for n in note_labels]
+        ticks = [(f, n) for f, n in zip(note_ticks, note_labels)]
+        self.plot_widget.getAxis('left').setTicks([ticks])
 
-        # 🎯 y축 index 범위 고정
-        self.plot_widget.setYRange(0, len(self.indexed_notes) - 1)
+        self.label = QLabel("🎧 분석 준비 중...")
+        self.label.setStyleSheet("font-size: 16px; padding: 10px;")
 
-        self.plot_data = self.plot_widget.plot(pen='m')
-        self.data = []
-        self.max_length = 100
+        layout = QVBoxLayout()
+        layout.addWidget(self.plot_widget)
+        layout.addWidget(self.label)
+        container = QWidget()
+        container.setLayout(layout)
+        self.setCentralWidget(container)
 
-        self.sample_rate = 44100
-        self.block_size = 1024
-
-        self.stream = sd.InputStream(
-            callback=self.audio_callback,
-            channels=1,
-            samplerate=self.sample_rate,
-            blocksize=self.block_size
-        )
-        self.stream.start()
+        self.audio_buffer = np.zeros(BUFFER_SIZE, dtype=np.float32)
+        self.pitch_history = np.zeros(VISUAL_WINDOW)
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plot)
-        self.timer.start(50)
+        self.timer.start(100)
+
+        self.stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype='float32',
+            callback=self.audio_callback
+        )
+        self.stream.start()
 
     def audio_callback(self, indata, frames, time, status):
-        audio = indata[:, 0]
-        freq = detect_pitch(audio, self.sample_rate)
-
-        # 🎯 주파수가 범위 내일 때만
-        if 196.0 <= freq <= 1318.51:
-            note_name, note_freq, note_idx = snap_to_note_index(freq, self.indexed_notes)
-            self.data.append(note_idx)
-        else:
-            self.data.append(np.nan)
-
-        if len(self.data) > self.max_length:
-            self.data.pop(0)
+        if status:
+            print(status)
+        self.audio_buffer = np.roll(self.audio_buffer, -len(indata))
+        self.audio_buffer[-len(indata):] = indata[:, 0]
 
     def update_plot(self):
-        self.plot_data.setData(self.data)
+        try:
+            audio = self.audio_buffer.astype(np.float32)
+            _, freq_array, confidence, _ = crepe.predict(
+                audio, SAMPLE_RATE, viterbi=True, step_size=100
+            )
+            pitch = freq_array[-1] if confidence[-1] > 0.5 and PITCH_MIN <= freq_array[-1] <= PITCH_MAX else 0.0
+        except:
+            pitch = 0.0
 
+        note_name = hz_to_note_name(pitch)
+        target_freq = librosa.note_to_hz(note_name) if note_name != "-" else 0
+        cent = cents_error(pitch, target_freq)
+        cent_text = f"{cent:+.1f} cents" if not np.isnan(cent) else "-"
 
-if __name__ == "__main__":
+        if self.timer.remainingTime() % 2000 < 150:
+            try:
+                jitter, shimmer = analyze_voice(self.audio_buffer, SAMPLE_RATE)
+                self.label.setText(
+                    f"🎵 음정: {note_name} ({pitch:.1f} Hz), 센트 오차: {cent_text}\n"
+                    f"📊 Jitter: {jitter:.2f}%, Shimmer: {shimmer:.2f}%"
+                )
+            except Exception as e:
+                self.label.setText("분석 오류: " + str(e))
+
+        self.pitch_history = np.roll(self.pitch_history, -1)
+        self.pitch_history[-1] = pitch if pitch > 0 else np.nan
+        self.curve.setData(self.pitch_history)
+
+if __name__ == '__main__':
     app = QApplication(sys.argv)
-    window = RealTimePitchPlot()
+    window = CREPEAnalyzer()
     window.show()
     sys.exit(app.exec_())

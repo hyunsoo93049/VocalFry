@@ -124,17 +124,25 @@ class ScailingTrainer(QMainWindow):
 
     def audio_callback(self, indata, frames, time, status):
         audio = indata[:, 0]
+
         if len(audio) < 1024:
             return
 
         try:
-            _, freq, confidence, _ = crepe.predict(audio, self.sample_rate, viterbi=True)
+            # CREPE로 예측
+            _, freq, confidence, _ = crepe.predict(audio, self.sample_rate, viterbi=True, verbose =0)
+
+            # 주파수가 충분히 자신 있을 때만
             if confidence[0] > 0.5:
                 midi = snap_to_midi(freq[0])
+                note = midi_to_note_name(midi)
                 self.data.append(midi)
-                self.current_note_text = midi_to_note_name(midi)
+                self.current_note_text = note
                 self.user_sequence.append(midi)
-                self.check_pitch_match()
+
+                # ✅ 실시간 정보 출력
+                print(f"[🎙] Freq: {freq[0]:.2f} Hz | Confidence: {confidence[0]:.2f} | Note: {note}")
+
             else:
                 self.data.append(np.nan)
                 self.current_note_text = ""
